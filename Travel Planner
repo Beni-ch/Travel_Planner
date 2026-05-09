@@ -1,1 +1,927 @@
+# ============================================================
+# FERIEN-FINDER
+# ============================================================
+# Kurs: Grundlagen und Methoden der Informatik, HSG FS26
+# Quelle KI-generierter Code: Claude / Anthropic
+#
+# Datenquellen:
+#   1. destinations.csv   → Aktivitätsprofil + Sicherheit + Hotelpreisschätzung
+#                           Sicherheits-Index: Numbeo Safety Index 2025
+#                           (https://www.numbeo.com/crime/region_rankings_current.jsp)
+#                           Aktivitäten: kuratierte Recherche
+#                           Hotelpreise (CHF/Nacht): kuratierte Recherche
+#   2. OpenWeatherMap     → Live-Temperaturen & Wetter
+#   3. Booking.com        → Hotelsuche (nur auf Knopfdruck)
+#   4. REST Countries     → Währung, Sprache, Flagge
+# ============================================================
 
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import requests
+import math
+from math import radians, cos, sin, asin, sqrt
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import MinMaxScaler
+
+st.set_page_config(page_title="Ferien-Finder", page_icon="🏖️", layout="wide")
+
+# ──────────────────────────────────────────────────────────
+# API-KEYS
+# ──────────────────────────────────────────────────────────
+#Schlüssel für die APIs
+#Openweather: Live-Wetterdaten
+#Booking: Hotelsuche 
+OPENWEATHER_KEY = "e9032553e7fb49e5cfb4c520e5671546"
+BOOKING_KEY     = "7d0ff1365emsh4c86f5f881ad0b9p118419jsn7ef3a7b8ee4e"
+
+
+# ──────────────────────────────────────────────────────────
+# CSV LADEN – Destinationsdaten
+# ──────────────────────────────────────────────────────────
+#Funktion wird nur einmal (beim ersten Aufruf) ausgeführt und das Erbegnis wird gespeichert.
+#Ladekreisel wird deaktiviert, sodass dieser nicht angezeigt wird.
+@st.cache_data(show_spinner=False)
+#Funktion wird definiert namens load_csv
+#Die Funktion gibt einen Pandas DataFrame zurück
+def load_csv(): 
+    """
+    Lädt destinations.csv mit Aktivitätsprofil und Sicherheitsdaten.
+    Sicherheits-Index: Numbeo Safety Index 2025
+    https://www.numbeo.com/crime/region_rankings_current.jsp
+    Skala 0–100 (100 = maximale Sicherheit).
+
+    destinations.csv muss im gleichen Ordner wie Ferien-Finder.py liegen.
+    Der Pfad wird relativ zur .py-Datei aufgelöst, damit streamlit
+    von jedem Verzeichnis aus gestartet werden kann.
+    """
+    import os
+    # damit "destination.csv" gefunden wird, falls er sich nicht im gleichen Ordner befindet wie dieses Programm
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "destinations.csv")
+    return pd.read_csv(csv_path)
+    #liest die CSV-Datei und gibt einen Pandas DataFrame, eine Tabelle, zurück, auf die man zurückgreifen kann
+
+# diesen Pandas Dataframe (Städtetabelle aus der CSV) wird gespeichert in "df"
+# so kann wieder auf die Tabelle zurückgegriffen werden
+df = load_csv()
+
+# df["city"] = greift auf die Spalte "city" (Städte) in der Tabelle zurück 
+# tolist() wandelt das Pandas-Format in eine Pythonliste um
+DEST_NAMES = df["city"].tolist()
+
+# Übersetzungstabelle als Dictionary
+# Städtenamen übersetzt von Englisch auf Deutsch, da die App auf Deutsch, aber die API auf Englisch
+BOOKING_QUERY = {
+    "Barcelona": "Barcelona", "Santorini": "Santorini",  "Reykjavik": "Reykjavik",
+    "Dubrovnik": "Dubrovnik", "Lissabon":  "Lisbon",     "Amsterdam": "Amsterdam",
+    "Wien":      "Vienna",    "Kopenhagen":"Copenhagen", "Prag":      "Prague",
+    "Rom":       "Rome",      "Paris":     "Paris",      "Berlin":    "Berlin",
+    "Budapest":  "Budapest",  "Porto":     "Porto",      "Zermatt":   "Zermatt",
+    "Mallorca":  "Palma de Mallorca",      "Oslo":       "Oslo",
+    "Athen":     "Athens",    "Istanbul":  "Istanbul",   "Krakau":    "Krakow",
+}
+
+# Dicitonary: mit den Tuples arbeitet der Code, das links ist für die Benutzer
+TEMP_RANGES = {
+    "0-5°C":   (0,  5),  "5-10°C":  (5,  10), "10-15°C": (10, 15),
+    "15-20°C": (15, 20), "20-25°C": (20, 25),  "25-30°C": (25, 30),
+    "30-35°C": (30, 35), "35-40°C": (35, 40),
+}
+
+
+# ──────────────────────────────────────────────────────────
+# API 1: OPENWEATHERMAP – Live-Wetter abrufen
+# ──────────────────────────────────────────────────────────
+
+def fetch_weather(lat: float, lon: float):
+    # lat sowie lon müssen eine Dezimalzahl bzw. float sein 
+    # lat = Breitengrad 
+    # lon = Längengrad
+    """
+    OpenWeatherMap /weather → Temperatur, Beschreibung, Luftfeuchtigkeit.
+    """
+    try:
+        # falls etwas schief läuft, wird "except" ausgeführt --> Fehlermeldung
+        # damit das Programm nicht abstürzt bei Fehler
+
+        # fragt die API nach Wetterdaten
+        # Params: Koordinaten, API-Key, Format der Antworten 
+        # metric: Ausgabe in Grad Celsius
+        # de: die Beschreibungen auf Deutsch
+        # timeout = 8: wenn API nach 8 Sekunden nicht antwortet, wird die Anfrage abgebrochen
+        # ansonsten würde das Programm ewig warten
+        r = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={"lat": lat, "lon": lon, "appid": OPENWEATHER_KEY,
+                    "units": "metric", "lang": "de"},
+            timeout=8,
+        )
+        # 200 = die Daten sind gut, wenn was anderes entweder falscher API-Key oder Adresse nicht gefunden
+        # json = Umwandlung in Dictionary
+        # aus diesem Dictionary zieht das Programm dann die Temperatur, gefühlte Temperaturm Luftfeuchtigkeit und Beschreibung 
+        # capitalize() Beschreibung fängt mit einem grossen Buchstaben an
+        if r.status_code == 200:
+            d = r.json()
+            return {
+                "temp":        round(d["main"]["temp"]),
+                "feels_like":  round(d["main"]["feels_like"]),
+                "humidity":    d["main"]["humidity"],
+                "description": d["weather"][0]["description"].capitalize(),
+            }
+        return {"error": f"Status {r.status_code}: {r.json().get('message', '')}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ──────────────────────────────────────────────────────────
+# API 2: BOOKING.COM – Hotelsuche
+# ──────────────────────────────────────────────────────────
+# Diese Funktion wird nur aufgerufen, wenn der Nutzer auf "Hotel suchen" klickt
+
+def fetch_hotel_data(city_name: str, check_in: str, check_out: str, adults: int):
+    # Funktion bekommt vier Information: Stadtname, An- und Abreisedatum sowie Anzahl Erwachsene
+    """Booking.com via RapidAPI. Nur auf Knopfdruck aufgerufen."""
+    headers = {
+        "X-RapidAPI-Key":  BOOKING_KEY,
+        "X-RapidAPI-Host": "booking-com15.p.rapidapi.com",
+    }
+    # API-Key und welche API, wir nutzen wollen 
+    try:
+        # falls ein Fehler auftritt, springt er zum "except"
+        r_dest = requests.get(
+            "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchDestination",
+            headers=headers, params={"query": city_name}, timeout=10,
+        )
+        # Anfrage an API
+        # fragt nach dest_id für city_name
+        # nach 10 Sekunden abbrechen, wenn keine Antwort kommt
+        if r_dest.status_code != 200:
+            return {"error": f"Status {r_dest.status_code}: {r_dest.text[:100]}"}
+            # wenn nicht gleich 200 --> Fehler
+            # gibt Statuscode und Fehlermeldung zurück
+            # gibt nur die ersten 100 Zeichen der Fehlermeldung zurück 
+        dest_items = r_dest.json().get("data", [])
+        # r_dest.json() --> Umwandlung von API-Antwort in ein dictionary
+        # get(...) --> holt die Liste vonn Destinationen zum Key "data", falls "data" nicht existiert: leere Liste statt Absturz
+        if not dest_items:
+            return {"error": f"Keine Destination für '{city_name}' gefunden."}
+            # falls die Liste leer ist, gibt es eine Fehlermeldung zurück
+
+        dest_id, search_type = None, "CITY"
+        # zwei Variabeln werden definiert
+        # dest_id hat noch keinen Wert --> wird in der Schleife gesetzt
+        for item in dest_items:
+            # geht jeden Eintrag (dictionary) in der Liste "dest_items" durch
+            if item.get("search_type", "").lower() == "city":
+                # holt den Value vom Key "search_type"
+                # == "city" Bedingung erfüllt, wenn es eine Stadt ist 
+                # .lower(): damit Gross- und Kleinschreibung keine Rolle spielt
+                dest_id = str(item["dest_id"]); search_type = "CITY"; break
+                # speichert die gefundene ID als String (API erwartet String)
+                # break: stoppt die Schleife, weitere Iteration unnötig
+                # search_type auf "CITY" gesetzt  --> für die zweite API-Anfrage
+      
+        if not dest_id:
+            # wird erreicht, wenn die Schleife keinen Eintrag vom Typ "city" gefunden hat
+            dest_id = str(dest_items[0]["dest_id"])
+            # erstes Element (= dictionary) der Liste "dest_items" (Index 0)
+            # holt den Value zum Key "dest_id"
+            # str(): wandelt Integer in String um, weil API einen String erwartet
+            search_type = dest_items[0].get("search_type", "city").upper()
+            # erstes Element (= dictionary) der Liste "dest_items" (Index 0)
+            # holt den Value zum Key "search_type"
+            # falls "search_type" nicht existiert, "city" als Ersatzwert
+            # .upper(): wird grossgeschrieben, weil API das so erwartet
+
+
+        r_h = requests.get(
+            "https://booking-com15.p.rapidapi.com/api/v1/hotels/searchHotels",
+            # zweite API-Anfrage: sucht jetzt echte Hotels
+            headers=headers,
+            params={
+                "dest_id": dest_id, "search_type": search_type,
+                "arrival_date": check_in, "departure_date": check_out,
+                "adults": str(max(1, int(adults))), "room_qty": "1",
+                "units": "metric", "temperature_unit": "c",
+                "languagecode": "de", "currency_code": "CHF",
+            },
+            # "dest_id" und "search_type" aus erster Anfrage 
+            # Anreise- und Abreisedatum, Anzahl Reisende vom Benutzer eingegeben
+            # bei "adults" sichergesellt, dass min. 1 Erwachsener und in String
+            # Anzahl Zimmer immer 1
+            # Temperatur in Grad Celsius; Antwort auf Deutsch, Währung in Schweizer Franken
+            timeout=12,
+            # nach 12 Sekunden abbrechen, falls API nicht antwortet
+        )
+        if r_h.status_code != 200:
+            return {"error": f"Status {r_h.status_code}: {r_h.text[:100]}"}
+            # != 200 --> Anfrage nicht erfolgreich
+            # sofort abbrechen und Fehlermeldung zurückgeben
+            # nur die ersten 100 Zeichen der Fehlermeldung
+
+        raw    = r_h.json().get("data", {})
+        # API-Antwort in Dictionary umwandeln
+        # holt den Value zum Key "data"
+        # falls "data" nicht existiert: leeres Dicitonary als Ersatzwert
+        hotels = raw.get("hotels", []) if isinstance(raw, dict) else raw
+        # prüft ob "raw" ein Dictionary ist
+        # API gibt manchmal ein Dictionary, manchmal direkt eine Liste zurück
+        # wenn Dictionary --> holt den Value (die Liste) zum Key "hotels"
+        # wenn Liste --> "raw" direkt verwenden, es sind sind bereits die Hotels
+        # falls "hotels" nicht existiert: leere Liste als Ersatzwert
+        if not hotels:
+            return {"error": "Keine Hotels gefunden.", "hotels": []}
+            # wenn hotels leer ist --> keine Hotels gefunden
+
+        prices, hotel_list = [], []
+        # zwei Listen definiert
+        # "prices" --> sammelt alle Preise, um später den Durchschnitt zu berechnen
+        # "hotel_list" --> sammelt alle Hotel-Dicitonaries für die Ausgabe
+        for h in hotels[:20]:
+            # geht die ersten 20 Hotels (= 20 Dictionaries) der Liste durch
+            # damit nicht zu viele Daten
+            prop  = h.get("property", {})
+            # holt den Value (dictionary) zum Key "property"
+            # falls "property" nicht exisitert --> leeres Dictionary als Ersatzwert
+            price = prop.get("priceBreakdown", {}).get("grossPrice", {}).get("value")
+              # holt das Dictionary (value) zum Key "priceBreakdown", falls nicht existiert: leeres dictionary statt Absturz
+              # holt das Dictionary (value) zum Key "grossPrice", falls nicht existiert: leeres dictionary statt Absturz
+              # holt Value (= Preis in CHF) zum Key "value", falls nicht existiert: None statt Absturz
+
+            stars = int(prop.get("accuratePropertyClass", 0))
+                # holt die Sternekategorie des Hotels, z.B. 4
+                # int() → wandelt in Integer um
+                # falls nicht existiert → 0 als Ersatzwert
+
+            if price: prices.append(price)
+                # wenn price nicht none --> hinzufügen zur Liste
+            hotel_list.append({"name": prop.get("name", "Unbekannt"),
+                                "stars": stars, "rating": prop.get("reviewScore", ""),
+                                "price": price})
+            # fügt ein Dictionary mit Name des Hotels, Sternekategorie, Bewertung und Preis hinzu
+        return {
+            "avg_price": round(sum(prices) / len(prices)) if prices else None,
+            # Durchschnittspreis (gerundet) wird berechnent, wenn die Liste nicht leer
+            # wenn Liste leer --> kein Wert
+            "min_price": round(min(prices)) if prices else None,
+            # holt den kleinsten Wert aus der Liste und gibt sie gerundet zurück, wenn Liste nicht leer
+            # wenn Liste leer --> kein Wert
+            "hotels":    hotel_list,
+            # gibt die gesammelte Liste aller Hotel-Dictionaries zurück
+        }
+    except requests.exceptions.Timeout:
+        return {"error": "Zeitüberschreitung bei Booking.com."}
+         # spezieller Fehlertyp nur für Timeout
+         # wird erreicht wenn die API nach 12 Sekunden nicht antwortet
+         # gibt verständliche Fehlermeldung zurück
+
+    except Exception as e:
+        return {"error": str(e)}
+        # fängt alle anderen Fehler ab
+
+
+# ──────────────────────────────────────────────────────────
+# API 3: REST COUNTRIES – Länderinfos
+# ──────────────────────────────────────────────────────────
+# API mit Informationen zu Ländern
+# kein API-Key nötig, da für alle frei zugänglich
+def fetch_country_info(country_code: str):
+    # country-code = Ländercode mit 2 Buchstaben, bspw. Island = "IS"
+    # dieser Ländercode steht in unserer CSV als "country_code"
+    """gibt die Währung, Sprache, Flaggen-Emoji, Name vom Land auf Deutsch zurück"""
+    try:
+        # schickt Anfrage an die API 
+        # zusammengesetzte URL --> für jedes Land eine andere andere URL
+        r = requests.get(
+            f"https://restcountries.com/v3.1/alpha/{country_code}", timeout=5)
+        if r.status_code == 200:
+            d          = r.json()[0]
+            # r.json gibt eine Liste zurück, auch wenn nur ein Land benötigt aufgrund des Design vom API "RestCountries"
+            # da wir nicht mit einer Liste arbeiten können, wir greifen auf das erste Element der Liste zurück
+            # [0] in der Liste --> das ist ein dictionary für ein bestimmtes Land
+            currencies = d.get("currencies", {})
+            # sucht "currencies" (=Währung) aus "d"
+            # wenn das nicht existiert, stürzt das Programm nicht ab, sondern gibt einfach ein leeres Dictionary zurück
+            currency   = list(currencies.values())[0]["name"] if currencies else "–"
+            # list(...) --> wird in eine Liste umgewandelt
+            # [0] --> holt den ersten Eintrag der Liste 
+            # ["name"] ist der Key, holt den Value dazu (Name der Währung)
+            # if currencies = wenn currencies nicht leer --> führt das aus
+            # ansonsten (else), wenn if nicht erfüllt, wenn currencies nicht leer --> "-" als Platzhalter
+            languages  = list(d.get("languages", {}).values())
+            # sucht dictionary "language" aus dictionary "d"
+            # gibt nur values zurück, keys sind hier nicht relevant
+            # mit list() werden die value(s --> wenn das Land mehrere Sprachen) zu einer Liste umgewandelt
+            
+            return {
+                "currency": currency,
+                "language": languages[0] if languages else "–",
+                # ausgegeben wird nur der erste Eintrag der Liste, damit nicht zu unübersichtlich
+                # wenn leer --> Platzhalter "-"
+                "flag":     d.get("flags", {}).get("emoji", ""), 
+                # holt das dictionary (value) zum key "flags", falls nicht exisiert: leeres dictionary statt Absturz
+                # holt value (= Flaggen-Emojie des Landes) zum key "emoji", falls nicht exisiert: leerer String statt Absturz
+                "name_de":  d.get("translations", {}).get("deu", {}).get("common", ""),
+                # holt das dictionary (value) zum key "translations", falls nicht exisiert: leeres dictionary statt Absturz
+                # holt das dictionary (value) zum key "deu", falls nicht existiert: leeres dictionary statt Absturz
+                # holt value (= deutscher Name des Landes) zum key "common", falls nicht exisiert: leerer string statt Absturz
+            }
+    except Exception:
+        pass
+        # falls irgendein Fehler auftritt, läuft das Progrmm weiter 
+    return {"currency": "–", "language": "–", "flag": "", "name_de": ""}
+    # gibt leere Platzhalterwerte zurück bei Fehler
+
+
+# ──────────────────────────────────────────────────────────
+# DATEN-AGGREGATION
+# ──────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=300, show_spinner=False)
+# ttl=300 --> Cache ist 5 Minuten gültig, danach werden frische Daten geholt
+# weil sich Wetterdaten alle paar Minuten ändern können
+def load_live_data():
+    """
+    Lädt Live-Wetter (OpenWeatherMap) + Länderinfos (REST Countries)
+    für alle 20 Destinationen. Gecacht 5 Minuten.
+    Aktivitäten und Sicherheit kommen aus destinations.csv.
+    """
+    results = []
+    # leere Liste, wird mit einem Dictionary pro Stadt befüllt
+
+    for _, row in df.iterrows():
+        # geht jede Zeile der CSV durch
+        # df.iterrows() --> gibt jede Zeile einzeln zurück
+        # _ = Zeilennummer (Index) --> interessiert uns nicht, deshalb _
+        # row = aktuelle Zeile mit allen Spalten
+
+        sights = [row[f"sight_{i}"] for i in range(1, 6)
+                  if pd.notna(row.get(f"sight_{i}", ""))]
+        # holt Sehenswürdigkeiten aus den Spalten sight_1 bis sight_5 der CSV
+        # range(1, 6) --> i nimmt Werte 1, 2, 3, 4, 5 an
+        # f"sight_{i}" --> baut Spaltenname zusammen: "sight_1", "sight_2", ...
+        # pd.notna() --> prüft ob der Wert nicht leer ist
+        # manche Städte haben weniger als 5 Sehenswürdigkeiten --> leere Felder werden übersprungen
+        # Ergebnis: Liste z.B. ["Sagrada Familia", "Park Güell", "Las Ramblas"]
+
+        results.append({
+            # .append() --> fügt ein Element ans Ende der Liste hinzu
+            # hier wird für jede Stadt ein Dictionary mit allen Infos hinzugefügt
+
+            "name":         row["city"],
+            # holt den Value (Stadtname) zum Key "city" aus der aktuellen CSV-Zeile
+
+            "lat":          float(row["lat"]),
+            "lon":          float(row["lon"]),
+            # CSV speichert alle Werte als Text --> float() wandelt Text in Dezimalzahl um
+            # "46.5" (Text) → 46.5 (Zahl)
+
+            "country":      row["country_code"],
+            # 2-Buchstaben-Ländercode aus CSV, z.B. "ES" für Spanien
+
+            # Aus CSV (Numbeo Safety Index + kuratierte Aktivitätsdaten)
+            "safety_index": float(row["safety_index_numbeo"]),
+            # Sicherheitsindex als Dezimalzahl, z.B. 72.3
+
+            "has_beach":    int(row["has_beach"]),
+            "has_mountains":int(row["has_mountains"]),
+            "has_culture":  int(row["has_culture"]),
+            "has_nature":   int(row["has_nature"]),
+            "nightlife":    int(row["nightlife"]),
+            # CSV speichert diese Werte als Text --> int() wandelt Text in Integer um
+            # 1 = vorhanden, 0 = nicht vorhanden
+
+            "budget_level":    int(row["budget_level"]),
+            # Budgetklasse, z.B. 1 = günstig, 2 = mittel, 3 = teuer
+
+            "hotel_price_chf": int(row["hotel_price_chf"]),
+            # durchschnittlicher Hotelpreis in CHF aus CSV
+
+            # Reisezeit ab Zürich aus CSV
+            # N/A = nicht sinnvoll erreichbar mit diesem Transportmittel → None
+            "flight_hours": None if str(row.get("flight_hours","N/A")).strip()=="N/A"
+                            else float(row["flight_hours"]) if "flight_hours" in row.index else 2.0,
+            # drei Fälle:
+            # 1. Wert ist "N/A" → None (z.B. Zürich ist nicht sinnvoll mit Flug erreichbar)
+            # 2. Spalte existiert und hat Wert → float() wandelt Text in Zahl
+            # 3. Spalte existiert nicht in CSV → 2.0 als Ersatzwert
+
+            "train_hours":  None if str(row.get("train_hours","N/A")).strip()=="N/A"
+                            else float(row["train_hours"]) if "train_hours" in row.index else None,
+            # gleiche drei Fälle wie flight_hours, Ersatzwert ist None
+
+            "car_hours":    None if str(row.get("car_hours","N/A")).strip()=="N/A"
+                            else float(row["car_hours"]) if "car_hours" in row.index else None,
+            # gleiche drei Fälle wie flight_hours, Ersatzwert ist None
+
+            "sights": sights,
+            # Liste der Sehenswürdigkeiten, oben bereits berechnet
+
+            # Live-APIs – werden für jede Stadt einmal aufgerufen
+            "country_info": fetch_country_info(row["country_code"]),
+            # ruft fetch_country_info() auf --> gibt Dictionary mit Währung, Sprache, Flagge, Ländername zurück
+
+            "weather": fetch_weather(float(row["lat"]), float(row["lon"])),
+            # ruft fetch_weather() auf --> gibt Dictionary mit Temperatur, Beschreibung, Luftfeuchtigkeit zurück
+        })
+
+    return results
+    # gibt Liste mit 20 Dictionaries zurück – eines pro Stadt
+
+
+# ──────────────────────────────────────────────────────────
+# KNN MACHINE-LEARNING-MODELL
+# ──────────────────────────────────────────────────────────
+# Feature-Vektor: [live_temp, has_nature, has_culture, budget_level]
+# live_temp   → OpenWeatherMap (live)
+# has_nature, has_culture → destinations.csv
+# budget_level→ destinations.csv
+
+def build_feature_matrix(dest_data: list) -> np.ndarray:
+    rows = []
+    for d in dest_data:
+        temp = d["weather"].get("temp", 15) if not d["weather"].get("error") else 15
+        rows.append([
+            temp,
+            d["has_nature"],
+            d["has_culture"],
+            d["budget_level"],
+        ])
+    return np.array(rows, dtype=float)
+
+def run_knn(user_vec: np.ndarray, feat_mat: np.ndarray, k: int = 10):
+    all_data   = np.vstack([feat_mat, user_vec])
+    all_scaled = MinMaxScaler().fit_transform(all_data)
+    X, u       = all_scaled[:-1], all_scaled[-1:]
+    knn        = NearestNeighbors(n_neighbors=min(k, len(X)), metric="euclidean")
+    knn.fit(X)
+    dist, idx  = knn.kneighbors(u)
+    return idx[0], dist[0]
+
+
+# ──────────────────────────────────────────────────────────
+# SCORING
+# ──────────────────────────────────────────────────────────
+# Gewichtung: 40% Wetter | 30% Aktivitäten | 20% Sicherheit | 10% Budget
+# Sicherheit: Numbeo Safety Index (0–100) → umgerechnet auf 0–10
+
+def temp_score(dest_temp: float, user_range: str) -> float:
+    low, high = TEMP_RANGES.get(user_range, (20, 25))
+    return round(max(0.0, 10 - abs(dest_temp - (low + high) / 2) * 0.8), 1)
+
+def activity_score(d: dict, reisearten: list) -> float:
+    """
+    Bewertet Aktivitäten-Match anhand der CSV-Flags.
+    Jede Reiseart mappt auf ein oder mehrere CSV-Felder.
+    """
+    mapping = {
+        "Städtereise":        ["has_culture"],
+        "Kultur & Museen":    ["has_culture"],
+        "Nightlife & Ausgang":["has_culture", "nightlife"],
+        "Natur & Wandern":    ["has_nature", "has_mountains"],
+        "Entspannung":        ["has_nature", "has_beach"],
+        "Abenteuer & Sport":  ["has_nature", "has_mountains"],
+        "Strandurlaub":       ["has_beach"],
+        "Skiferien":          ["has_mountains"],
+    }
+    if not reisearten:
+        return 7.0
+    total_checks, hits = 0, 0
+    for art in reisearten:
+        for flag in mapping.get(art, ["has_culture"]):
+            total_checks += 1
+            hits += d.get(flag, 0)
+    return round(min(10.0, hits / total_checks * 10), 1) if total_checks > 0 else 7.0
+
+def budget_score_fn(hotel_price_chf: int, budget_pp: float, naechte: int) -> float:
+    est = hotel_price_chf * naechte
+    if   budget_pp >= est * 1.3: return 10.0
+    elif budget_pp >= est:       return 8.0
+    elif budget_pp >= est * 0.7: return 5.0
+    return 2.0
+
+def compute_scores(candidates, dest_data, user_temp, reisearten,
+                   budget_pp, naechte, min_safety_idx) -> list:
+    data_map = {d["name"]: d for d in dest_data}
+    results  = []
+    for name in candidates:
+        d      = data_map[name]
+        safety = d["safety_index"]          # Numbeo 0–100
+        safety_10 = round(safety / 10, 1)  # Umrechnung auf 0–10 für Score
+        if safety < min_safety_idx:
+            continue
+        temp = d["weather"].get("temp", 15) if not d["weather"].get("error") else 15
+        t = temp_score(temp, user_temp)
+        a = activity_score(d, reisearten)
+        b = budget_score_fn(d["hotel_price_chf"], budget_pp, naechte)
+        total = t * 0.40 + a * 0.30 + safety_10 * 0.20 + b * 0.10
+        results.append({
+            "name": name, "total": round(total, 2),
+            "temp_score": t, "act_score": a,
+            "safety_score": safety_10, "budget_score": b,
+            "live_temp": temp, "safety_index": safety,
+        })
+    results.sort(key=lambda x: x["total"], reverse=True)
+    return results
+
+
+# ──────────────────────────────────────────────────────────
+# STREAMLIT UI – EINGABE
+# ──────────────────────────────────────────────────────────
+
+# Die folgenden Code-Zeilen bestimmen, wie die Website/App aufgebaut ist und welche Inputs gegeben werden können.
+
+st.title("Ferien-Finder 🏝️")
+st.write(
+    "Beantworte die Fragen – wir empfehlen dir per **Machine Learning** "
+    "deine Top 3 Reisedestinationen. "
+    "Wetterdaten: OpenWeatherMap (live) · Sicherheit: Numbeo Safety Index 2025 · "
+    "Hotels: Booking.com"
+)
+
+# Hier kann eine Sidebar aufgerufen werden und den Cache geleert werden, um von neuem anzufangen
+with st.sidebar:
+    st.subheader("⚙️ Einstellungen")
+    if st.button("🔄 Cache leeren & neu laden"):
+        st.cache_data.clear()
+        st.success("Cache geleert!")
+    st.caption("Sicherheitsdaten: Numbeo Safety Index 2025\n"
+               "Aktivitätsdaten: destinations.csv")
+
+# Divider helfen, die Seite übersichtlicher zu gestalten
+st.divider()
+
+# Der Website-Besucher kann sein Budget mithilfe eines Sliders angeben
+# Budget startet bei 100 CHF, geht bis 5000 CHF in 100er Schritten und ist zu Beginn auf 2000 CHF eingestellt
+st.subheader("💰 Gesamtbudget")
+budget = st.slider("Gesamtbudget (CHF)", 100, 5000, 2000, 100)
+
+# Besucher kann die Anzahl Reisenden angeben und es wird direkt ausgerechnet, wie viel Budget pro Person zur Verfügung steht
+# Es muss mindestens 1 Person sein und kann bis zu 20 Personen gehen. Zu beginn wird automatisch 2 angezeigt
+st.subheader("👥 Anzahl Reisende")
+anzahl    = st.number_input("Wie viele Personen reisen mit?", 1, 20, 2)
+budget_pp = budget // anzahl
+st.write(f"Ihr seid **{int(anzahl)}** Personen → **{budget_pp} CHF** pro Person")
+
+st.divider()
+
+# Der Besucher sucht ein Abreise- und Rückreisedatum aus
+# Automatisch wird ausgerechnet, wie viele Tage/Nächte die Reise dauert (wichtig für die Hotelsuche und das Budget)
+# Wenn das Rückreisedatum vor dem Abreisedatum ist, wird ein Fehler angezeigt
+# Um das ganzze übersichtlicher zu gestalten, werden die beiden Daten nebeneinander aufgeführt.
+st.subheader("📅 Reisedaten")
+c1, c2 = st.columns(2)
+with c1: abreise    = st.date_input("Abreise")
+with c2: rueckreise = st.date_input("Rückreise")
+
+naechte = (rueckreise - abreise).days
+if naechte > 0:
+    st.write(f"Reisedauer: **{naechte} Nächte**")
+else:
+    st.error("Rückreisedatum muss nach dem Abreisedatum liegen.")
+    naechte = 7
+
+st.divider()
+
+# Hier kann der Besucher auswählen, mit welchem Transportmittel er Reisen möchte
+# Wichtig fürs Budget und die CO2-Ausstoss Berechnung
+st.subheader("✈️ Transportmittel")
+transport = st.radio("Wie möchtest du reisen?", ("Flugzeug", "ÖV", "Auto"))
+
+# Der Besucher gibt an, wie lange er maximal bereit ist, zu fahren/fliegen
+# Schränkt die Destinationen ein; was zu weit weg ist, wird ansgeschlossen
+st.subheader("⏱️ Maximale Reisezeit")
+reisezeit = st.slider("Wie lange darf die Reise maximal dauern? (Stunden)", 1, 24, 12)
+st.write(f"Maximale Reisezeit: **{reisezeit} Stunden**")
+
+st.divider()
+
+# Der Besucher kann mehrere Reisetypen aussuchen, die auf ihn zutreffen
+# Dadurch kann der passende Ort gesucht werden, der die gewünschten Aktivitäten bietet
+st.subheader("🎯 Art der Reise")
+reisearten = st.multiselect(
+    "Was passt zu deiner Reise?",
+    ["Städtereise", "Kultur & Museen", "Nightlife & Ausgang",
+     "Natur & Wandern", "Entspannung", "Strandurlaub",
+     "Abenteuer & Sport", "Skiferien"],
+)
+
+st.divider()
+
+# Hier kann der Besucher auswählen, wie wichtig ihm die Sicherhheit der Destination ist
+# Die Destinationen werden mit Sicherheitsscores abgeglichen
+st.subheader("🛡️ Sicherheit")
+sicherheit_wahl = st.selectbox(
+    "Wie wichtig ist dir die Sicherheit?",
+    ["sehr wichtig", "wichtig", "nicht so wichtig", "egal"],
+)
+# Numbeo Safety Index: 0–100 (100 = sicherste Stadt)
+min_safety_map = {"sehr wichtig": 65.0, "wichtig": 50.0,
+                  "nicht so wichtig": 40.0, "egal": 0.0}
+min_safety_idx = min_safety_map[sicherheit_wahl]
+
+st.divider()
+
+# Der Besucher wählt aus, welche Durchschnittstemeratur (tagsüber) er sich wünscht
+# Hilft dabei, die Regionen einzugrenzen
+st.subheader("🌡️ Gewünschtes Wetter")
+temperatur = st.radio("Durchschnittstemperatur tagsüber:",
+                      list(TEMP_RANGES.keys()), index=4)
+st.divider()
+
+
+# ──────────────────────────────────────────────────────────
+# STREAMLIT UI – AUSGABE
+# ──────────────────────────────────────────────────────────
+
+# Die folgenden Code-Zeilen bestimmen, wie der Output aussehen soll
+
+# Wenn man auf den Button klickt, werden mithilfe von KI die Top 3 Destinationen herausgesucht, die am besten auf die Angaben passen
+if st.button("🔍 Meine Top 3 Destinationen finden!", type="primary"):
+
+    with st.spinner("⏳ Lade Live-Wetterdaten für alle Destinationen…"):
+        dest_data = load_live_data()
+
+    with st.sidebar:
+        st.subheader("🔧 API-Status")
+        weather_errors = [d["name"] for d in dest_data if d["weather"].get("error")]
+        if weather_errors:
+            st.warning(f"⚠️ Wetter n/a: {', '.join(weather_errors[:5])}")
+        else:
+            st.success("✅ OpenWeatherMap: OK")
+        st.info(f"📊 CSV geladen: {len(dest_data)} Städte")
+
+    # ── KNN Machine Learning ──
+    # Benutzer-Präferenzen als Feature-Vektor kodieren
+    tm = {k: (v[0] + v[1]) / 2 for k, v in TEMP_RANGES.items()}
+    wants_nature  = 1 if any(a in reisearten for a in
+                   ["Natur & Wandern", "Entspannung", "Abenteuer & Sport",
+                    "Strandurlaub", "Skiferien"]) else 0
+    wants_culture = 1 if any(a in reisearten for a in
+                   ["Städtereise", "Kultur & Museen", "Nightlife & Ausgang"]) else 0
+
+    # Budget pro Person pro Nacht → Budget-Level 1/2/3
+    # Einfluss auf KNN (10% Gewicht im Scoring)
+    cost_pp     = budget_pp / max(naechte, 1)
+    user_budget = 1 if cost_pp < 100 else (2 if cost_pp < 180 else 3)
+
+    # KNN: findet die 10 ähnlichsten Destinationen
+    user_vec   = np.array([[tm[temperatur], wants_nature, wants_culture, user_budget]])
+    feat_mat   = build_feature_matrix(dest_data)
+    knn_idx, _ = run_knn(user_vec, feat_mat, k=len(dest_data))  # alle ranken
+    candidates = [dest_data[i]["name"] for i in knn_idx]
+
+    # ── Transportmittel-Filter (ab Zürich) ──
+    # Startpunkt: Zürich. Reisezeiten aus destinations.csv.
+    # N/A = mit diesem Transportmittel nicht erreichbar → wird herausgefiltert.
+    def get_hours(dest, transport_key):
+        """Gibt Reisestunden zurück, None = nicht erreichbar."""
+        return dest.get(transport_key)
+
+    dest_lookup = {d["name"]: d for d in dest_data}
+
+    if transport == "Flugzeug":
+        reachable = [c for c in candidates
+                     if get_hours(dest_lookup[c], "flight_hours") is not None
+                     and get_hours(dest_lookup[c], "flight_hours") <= reisezeit]
+    elif transport == "ÖV":
+        reachable = [c for c in candidates
+                     if get_hours(dest_lookup[c], "train_hours") is not None
+                     and get_hours(dest_lookup[c], "train_hours") <= reisezeit]
+    elif transport == "Auto":
+        reachable = [c for c in candidates
+                     if get_hours(dest_lookup[c], "car_hours") is not None
+                     and get_hours(dest_lookup[c], "car_hours") <= reisezeit]
+    else:
+        reachable = candidates
+
+    # Fallback: falls Filter zu streng (< 3 Treffer), alle nehmen
+    candidates = reachable if len(reachable) >= 3 else candidates
+
+    scored = compute_scores(candidates, dest_data, temperatur, reisearten,
+                            budget_pp, naechte, min_safety_idx)
+    top3 = scored[:3]
+
+    if not top3:
+        st.error("Keine passenden Destinationen gefunden – Sicherheitskriterien anpassen.")
+        st.stop()
+
+    st.success("✅ Deine Top 3 Reisedestinationen!")
+    st.header("🌍 Deine Top 3 Destinationen")
+
+    data_map = {d["name"]: d for d in dest_data}
+    medals   = ["🥇", "🥈", "🥉"]
+    cols     = st.columns(3)
+
+    def haversine_km(lat1, lon1, lat2, lon2):
+        R    = 6371
+        dlat = radians(lat2 - lat1); dlon = radians(lon2 - lon1)
+        a    = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+        return 2 * R * asin(sqrt(a))
+
+    co2_h = {"Flugzeug": 200, "ÖV": 40, "Auto": 120}
+
+    for i, (entry, col) in enumerate(zip(top3, cols)):
+        name = entry["name"]
+        d    = data_map[name]
+        ci   = d["country_info"]
+        w    = d["weather"]
+
+        with col:
+            st.markdown(f"### {medals[i]} {name}")
+            st.markdown(f"*{ci.get('name_de', '')}* {ci['flag']}")
+            st.progress(
+                int(entry["total"] / 10 * 100),
+                text=f"Match-Score: {entry['total']:.1f}/10",
+            )
+
+            # Wetter – OpenWeatherMap (live)
+            if not w.get("error"):
+                st.metric("🌡️ Aktuelles Wetter", f"{w['temp']}°C", w["description"])
+                st.caption(f"Gefühlt {w['feels_like']}°C · {w['humidity']}% Luftfeuchte")
+            else:
+                st.metric("🌡️ Wetter", "n/a")
+                st.caption(f"⚠️ {w['error']}")
+
+            # Länderinfos – REST Countries (live)
+            st.write(f"💱 **{ci['currency']}**  |  🗣️ **{ci['language']}**")
+
+            # Sicherheit – Numbeo Safety Index (aus CSV)
+            safety_val = d["safety_index"]
+            safety_emoji = "🟢" if safety_val >= 65 else ("🟡" if safety_val >= 50 else "🔴")
+            st.write(f"🛡️ Sicherheit: {safety_emoji} **{safety_val}/100** *(Numbeo 2025)*")
+
+            # Aktivitätsprofil – aus CSV
+            tags = []
+            if d["has_beach"]:     tags.append("🏖️ Strand")
+            if d["has_mountains"]: tags.append("⛰️ Berge")
+            if d["has_culture"]:   tags.append("🏛️ Kultur")
+            if d["has_nature"]:    tags.append("🌿 Natur")
+            if d["nightlife"]:     tags.append("🎉 Nightlife")
+            st.write("🎯 " + "  ".join(tags))
+
+            # Sehenswürdigkeiten – aus CSV
+            st.write("📍 **Top Sehenswürdigkeiten:**")
+            for s in d["sights"]:
+                st.write(f"  • {s}")
+
+            # Hotelpreis (Schätzung aus CSV – kuratierte Recherche)
+            est_total = d["hotel_price_chf"] * naechte
+            st.write(f"🏨 Ø Hotelpreis: **~CHF {d['hotel_price_chf']}/Nacht**")
+            st.write(f"💰 Geschätzte Hotelkosten: **~CHF {est_total}** ({naechte} Nächte)")
+            st.caption("Genaue Preise → Hotelsuche unten")
+
+            # Reisezeit ab Zürich (aus CSV, N/A = nicht erreichbar)
+            if transport == "Flugzeug":
+                fh = d["flight_hours"]
+                st.write(f"✈️ Flugzeit: **{fh:.1f}h** ab Zürich" if fh else "✈️ Kein Direktflug ab Zürich")
+            elif transport == "ÖV":
+                th = d["train_hours"]
+                st.write(f"🚆 Zugzeit: **{th:.1f}h** ab Zürich" if th else "🚆 Per ÖV nicht sinnvoll erreichbar")
+            elif transport == "Auto":
+                ch = d["car_hours"]
+                st.write(f"🚗 Fahrzeit: **{ch:.1f}h** ab Zürich" if ch else "🚗 Per Auto nicht sinnvoll erreichbar")
+
+            # CO₂ (berechnet aus Haversine-Distanz Zürich → Destination)
+            km  = haversine_km(47.38, 8.54, d["lat"], d["lon"])
+            co2 = co2_h.get(transport, 200) * (km / 800) * 2
+            st.write(f"🌱 CO₂: ca. **{co2:.0f} kg** p.P. ({transport}, ~{km:.0f} km)")
+
+    st.divider()
+
+    # ── CHARTS ──
+    st.header("📊 Datenvisualisierung")
+    names_top3 = [e["name"] for e in top3]
+    v1, v2 = st.columns(2)
+
+    # Chart 1: Balkendiagramm Kategorie-Scores
+    with v1:
+        st.subheader("Score-Vergleich der Top 3")
+        fig, ax = plt.subplots(figsize=(7, 4))
+        fig.patch.set_facecolor("#0e1117"); ax.set_facecolor("#0e1117")
+        skeys  = ["temp_score", "act_score", "safety_score", "budget_score"]
+        slabs  = ["Wetter", "Aktivitäten", "Sicherheit", "Budget"]
+        scolrs = ["#4facfe", "#43e97b", "#fa709a", "#fee140"]
+        x, w   = np.arange(len(top3)), 0.2
+        for j, (k, c) in enumerate(zip(skeys, scolrs)):
+            ax.bar(x + j * w, [e[k] for e in top3], w,
+                   label=slabs[j], color=c, alpha=0.85)
+        ax.set_xticks(x + w * 1.5)
+        ax.set_xticklabels(names_top3, color="white", fontsize=11)
+        ax.set_ylim(0, 11); ax.set_ylabel("Score (0–10)", color="white")
+        ax.tick_params(colors="white"); ax.spines[:].set_color("#333")
+        ax.legend(facecolor="#1a1a2e", labelcolor="white", loc="lower right")
+        ax.set_title("Kategorie-Scores im Vergleich", color="white", fontsize=13)
+        plt.tight_layout(); st.pyplot(fig); plt.close()
+
+    # Chart 2: Radar-Chart Top-Destination
+    with v2:
+        st.subheader(f"Profil: {top3[0]['name']}")
+        cat_r  = ["Wetter", "Aktivitäten", "Sicherheit", "Budget", "Gesamt"]
+        vals   = [top3[0][k] for k in
+                  ["temp_score", "act_score", "safety_score", "budget_score", "total"]]
+        N      = len(cat_r)
+        angles = [n / N * 2 * math.pi for n in range(N)] + [0]
+        vplot  = vals + [vals[0]]
+        fig2, ax2 = plt.subplots(figsize=(5, 5), subplot_kw=dict(polar=True))
+        fig2.patch.set_facecolor("#0e1117"); ax2.set_facecolor("#0e1117")
+        ax2.plot(angles, vplot, color="#4facfe", linewidth=2)
+        ax2.fill(angles, vplot, color="#4facfe", alpha=0.25)
+        ax2.set_xticks(angles[:-1])
+        ax2.set_xticklabels(cat_r, color="white", size=10)
+        ax2.set_ylim(0, 10); ax2.tick_params(colors="white")
+        ax2.spines["polar"].set_color("#444"); ax2.grid(color="#333")
+        ax2.set_yticklabels(["2", "4", "6", "8", "10"], color="#888", size=7)
+        ax2.set_title(f"Radar: {top3[0]['name']}", color="white", size=13, pad=15)
+        plt.tight_layout(); st.pyplot(fig2); plt.close()
+
+    # Chart 3: Sicherheits-Vergleich aller 20 Städte (Numbeo)
+    st.subheader("🛡️ Numbeo Safety Index – alle Destinationen")
+    all_names    = [d["name"] for d in dest_data]
+    all_safety   = [d["safety_index"] for d in dest_data]
+    top3_set     = set(names_top3)
+    s_colors     = ["#4facfe" if n in top3_set else "#555" for n in all_names]
+    fig3, ax3    = plt.subplots(figsize=(12, 4))
+    fig3.patch.set_facecolor("#0e1117"); ax3.set_facecolor("#0e1117")
+    ax3.bar(all_names, all_safety, color=s_colors, alpha=0.9)
+    ax3.axhline(y=65, color="#43e97b", linestyle="--", linewidth=1, alpha=0.7,
+                label="Grenze: sehr sicher (65)")
+    ax3.axhline(y=50, color="#fee140", linestyle="--", linewidth=1, alpha=0.7,
+                label="Grenze: sicher (50)")
+    ax3.set_xticklabels(all_names, rotation=45, ha="right", color="white", fontsize=9)
+    ax3.tick_params(colors="white"); ax3.spines[:].set_color("#333")
+    ax3.set_ylabel("Safety Index (0–100)", color="white")
+    ax3.set_ylim(0, 100)
+    ax3.set_title("Numbeo Safety Index 2025 (blau = deine Top 3)",
+                  color="white", fontsize=12)
+    ax3.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=9)
+    plt.tight_layout(); st.pyplot(fig3); plt.close()
+
+    # Chart 4: Live-Temperaturen
+    st.subheader("🌡️ Live-Temperaturen aller Destinationen")
+    all_temps = [d["weather"].get("temp", 0) if not d["weather"].get("error") else 0
+                 for d in dest_data]
+    t_colors  = ["#4facfe" if n in top3_set else "#555" for n in all_names]
+    fig4, ax4 = plt.subplots(figsize=(12, 4))
+    fig4.patch.set_facecolor("#0e1117"); ax4.set_facecolor("#0e1117")
+    ax4.bar(all_names, all_temps, color=t_colors, alpha=0.9)
+    ax4.set_xticklabels(all_names, rotation=45, ha="right", color="white", fontsize=9)
+    ax4.tick_params(colors="white"); ax4.spines[:].set_color("#333")
+    ax4.set_ylabel("°C", color="white")
+    ax4.set_title("Aktuelle Live-Temperaturen (blau = deine Top 3)",
+                  color="white", fontsize=12)
+    plt.tight_layout(); st.pyplot(fig4); plt.close()
+
+    st.divider()
+
+
+# ──────────────────────────────────────────────────────────
+# BOOKING.COM HOTELSUCHE
+# ──────────────────────────────────────────────────────────
+
+# Wenn man sich eine Stadt aus dem Ranking ausgesucht hat, geht es direkt weiter nach Booking.com
+# Die bisherigen Daten werden übernommen, man sucht sich nur die Stadt und die Mindestanzahl Hotelsterne aus und es werden direkt passende Hotels angezeigt
+st.header("🏨 Hotels suchen")
+st.write("Direkte Hotelsuche via Booking.com für deine Wunschdestination.")
+
+st.subheader("🏨 Hotelsterne")
+min_sterne = st.slider("Wie viele Sterne soll dein Hotel mindestens haben?", 1, 5, 3)
+st.write(f"Mindestens **{min_sterne} Sterne**")
+
+hotel_city = st.selectbox("Destination:", list(BOOKING_QUERY.keys()))
+h_ci = abreise
+h_co = rueckreise
+st.info(f"📅 Check-in: **{abreise}** · Check-out: **{rueckreise}** ({naechte} Nächte) – übernommen von oben")
+h_adults = st.number_input("Erwachsene", 1, 6, min(int(anzahl), 6))
+
+if st.button("🔍 Hotels suchen"):
+    with st.spinner("Suche Hotels auf Booking.com…"):
+        result = fetch_hotel_data(
+            BOOKING_QUERY[hotel_city],
+            h_ci.strftime("%Y-%m-%d"),
+            h_co.strftime("%Y-%m-%d"),
+            int(h_adults),
+        )
+    if result.get("error"):
+        st.error(f"❌ {result['error']}")
+    else:
+        hotels   = result.get("hotels", [])
+        filtered = [h for h in hotels if h["stars"] >= min_sterne] or hotels
+        st.success(
+            f"**{len(filtered)} Hotels** in {hotel_city} (ab {min_sterne}★) – "
+            f"Ø CHF {result.get('avg_price', '?')}/Nacht | "
+            f"ab CHF {result.get('min_price', '?')}/Nacht"
+        )
+        for h in filtered[:10]:
+            stars_s  = "⭐" * h["stars"] if h["stars"] else ""
+            rating_s = f" | 🌟 {h['rating']}/10" if h["rating"] else ""
+            price_s  = f"CHF {h['price']:.0f}/Nacht" if h["price"] else "Preis n/a"
+            st.write(f"🏨 **{h['name']}** {stars_s} – ab **{price_s}**{rating_s}")
+
+st.divider()
+st.caption(
+    "Ferien-Finder · Wetter: OpenWeatherMap · Hotels: Booking.com via RapidAPI · "
+    "Länderinfos: REST Countries · Sicherheit: Numbeo Safety Index 2025 · "
+    "Aktivitäten: destinations.csv"
+)
